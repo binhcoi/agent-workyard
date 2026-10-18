@@ -54,7 +54,7 @@ func New(ctx context.Context, binary string, stderr io.Writer) (*Adapter, error)
 		client.close()
 		return nil, err
 	}
-	if err = client.write(map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
+	if err = client.write(ctx, map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
 		client.close()
 		return nil, err
 	}

@@ -60,6 +60,12 @@ func protocolPeer() {
 		case "initialize":
 			reply(map[string]any{"userAgent": "protocol-peer"})
 		case "initialized":
+		case "test/no-response":
+			// Keep reading other requests without acknowledging this one.
+		case "test/stall-stdin":
+			reply(map[string]any{})
+			// The parent must interrupt its pipe write and reap this offline peer.
+			time.Sleep(time.Hour)
 		case "thread/start":
 			counter++
 			id := fmt.Sprintf("thread-%d", counter)
