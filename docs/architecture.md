@@ -3,6 +3,10 @@
 This document describes the implemented foundation and its boundaries. Private
 planning documents remain external authority and are not distributed here.
 
+R0 targets Linux only. Preserve Linux/Windows portability at the architectural
+boundaries; native Windows support, implementation and runtime validation are
+post-MVP work and do not gate R0.
+
 ## Responsibility boundaries
 
 The supervisor supplies engineering judgment and accepts integrated outcomes.
@@ -51,7 +55,7 @@ backoff and fallback remain later resource-policy work.
 
 | Decision | Reason and limit |
 | --- | --- |
-| Go stack with pure Go SQLite | Native Linux/Windows builds and durable transactions without a framework or C compiler. Module path is local until a public import location is chosen. |
+| Go stack with pure Go SQLite | Native Linux builds for R0 and durable transactions without a framework or C compiler; long-term Linux/Windows portability remains a goal. Module path is local until a public import location is chosen. |
 | Internal packages | Contracts can evolve during R0 without presenting an unstable external SDK. |
 | Small CLI first | A harness can consume rendered instructions through local control without a second MCP interface. |
 | Versioned JSON manifests and Markdown instructions | Parse configuration deterministically while keeping profiles and skills directly readable. |

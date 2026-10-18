@@ -74,9 +74,9 @@ For native skill discovery, Codex supports symlinked skill folders in the
 [documented local skill locations](https://developers.openai.com/codex/skills/).
 If desired, link each individual `configs/default/skills/workyard-*` directory
 into an existing project's `.agents/skills/` using the matching skill name, only
-when that destination is absent. Preserve all existing entries. Windows users
-can use directory links where permitted, or the explicit rendering route without
-links. M1 supplies no automatic installer or overwrite operation.
+when that destination is absent. Preserve all existing entries. This R0 setup
+targets Linux; native Windows setup and runtime validation are deferred until
+after MVP. M1 supplies no automatic installer or overwrite operation.
 
 Shared updates take effect on the next load. Pin a shared checkout to a reviewed
 revision for reproducibility. Installation, upgrade merging, and adapter-specific

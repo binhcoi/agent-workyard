@@ -9,6 +9,10 @@ cancellation and conservative recovery. Codex is the only R0 worker adapter; the
 supervisor can use any compatible harness. Messaging and coding collaboration
 remain later work. See [the M2 runbook and remaining gaps](docs/m2.md).
 
+R0 targets Linux only. Native Windows support, implementation and runtime
+validation are deferred until after MVP. Linux/Windows portability remains a
+long-term architectural goal; Windows builds and tests are not R0 gates.
+
 ## Build and check
 
 Requires Go 1.27 or later. Durable state uses pure Go SQLite.
@@ -23,9 +27,6 @@ go build -o bin/workyard ./cmd/workyard
 bin/workyard config check --bundle configs/default
 bin/workyard config render --bundle configs/default --profile supervisor --skill workyard-plan
 ```
-
-On Windows, build `bin/workyard.exe` and invoke that path. A Windows build can be
-cross-compiled from Linux; that alone does not verify Windows runtime behavior.
 
 ## Use in another repository
 
