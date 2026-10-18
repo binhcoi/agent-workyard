@@ -1,4 +1,3 @@
-// Package codex reserves the sole required R0 worker adapter. M2 will implement
-// worker.Adapter here using independently addressable Codex conversations.
-// M1 makes no verified runtime capability claims and launches no Codex workers.
+// The Codex adapter uses structured App Server threads and turns. Native
+// handles remain opaque to the coordinator; workers share an owned runtime.
 package codex

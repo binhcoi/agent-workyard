@@ -1,9 +1,9 @@
 // Package worker defines the boundary implemented by worker harness adapters.
-// No implementation or worker launch is supplied in M1.
 package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -11,6 +11,10 @@ import (
 )
 
 var ErrUnsupported = errors.New("operation unsupported by adapter")
+
+// ErrRejected identifies a native refusal proving the requested operation did not start.
+// Transport errors and timeouts are ambiguous and must never be classified as rejections.
+var ErrRejected = errors.New("operation rejected by adapter")
 
 // Address is coordinator-owned and remains stable independently of native handles.
 type Address struct {
@@ -78,6 +82,16 @@ type Observation struct {
 	Result       *core.Result
 	Usage        []core.Usage
 	Limits       []core.RateLimit
+	// Handle is an opaque adapter checkpoint. The coordinator persists it without
+	// interpreting native thread/turn identifiers.
+	Handle  json.RawMessage
+	Entries []ConversationEntry
+}
+
+type Update struct {
+	Observation Observation
+	Kind        string
+	Evidence    string
 }
 
 type ConversationEntry struct {
@@ -100,11 +114,18 @@ type ConversationPage struct {
 // must not be converted into worker completion or automatic re-execution.
 type Adapter interface {
 	Runtime(context.Context, core.ID) (core.Runtime, error)
-	Start(context.Context, StartRequest) (Observation, error)
+	// Prepare allocates a conversation without executing the brief. Persist its
+	// checkpoint and a start intent before Start can launch a model turn.
+	Prepare(context.Context, StartRequest) (Observation, error)
+	Start(context.Context, Address) (Observation, error)
+	// Recover reconciles saved native state without launching another turn.
+	Recover(context.Context, StartRequest, Observation) (Observation, error)
 	Inspect(context.Context, Address) (Observation, error)
 	History(context.Context, Address, string) (ConversationPage, error)
 	Send(context.Context, Message) (Delivery, error)
 	Cancel(context.Context, Address) (Cancellation, error)
 	Resume(context.Context, Address) (Observation, error)
-	Subscribe(context.Context, Address) (<-chan core.Event, error)
+	// Updates carries full snapshots in order. It must never silently drop state.
+	Updates() <-chan Update
+	Close() error
 }

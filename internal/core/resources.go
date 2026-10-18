@@ -68,9 +68,11 @@ type ModelOption struct {
 
 // Selection is a supervisor decision; M1 does not implement scheduling or fallback.
 type Selection struct {
-	Resource      ResourceRef
-	Rationale     string
-	AllowFallback bool
+	// Empty inherits the harness default; adapters validate supported values.
+	ReasoningEffort string
+	Resource        ResourceRef
+	Rationale       string
+	AllowFallback   bool
 }
 
 type MeasurementSource string

@@ -14,7 +14,15 @@ const usage = `Usage:
   workyard config check --bundle DIR [--project DIR]
   workyard config render --bundle DIR --profile ID [--project DIR] [--skill ID ...]
 
-M1 checks or renders reusable instructions. It does not execute workers.
+  workyard coordinator serve --state DIR --model MODEL [--capacity N] [--codex PATH]
+  workyard coordinator resources|runtime --state DIR
+  workyard assignment put --state DIR --id ID --project DIR --supervisor ID --objective TEXT
+  workyard assignment list --state DIR
+  workyard task submit --state DIR --id ID --assignment ID --project DIR --brief FILE --bundle DIR [--profile ID] [--skill ID ...] [--effort LEVEL]
+  workyard task status|result|conversation|events|cancel --state DIR --id ID
+  workyard task list --state DIR
+
+Run the coordinator separately from supervisor sessions. M2 workers use read-only execution.
 `
 
 func main() {
@@ -36,6 +44,9 @@ func run(args []string, out, stderr io.Writer) error {
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
 		_, err := io.WriteString(out, usage)
 		return err
+	}
+	if len(args) > 0 && args[0] != "config" {
+		return execution(args, out, stderr)
 	}
 	if len(args) < 2 || args[0] != "config" || (args[1] != "check" && args[1] != "render") {
 		return errors.New(usage)
