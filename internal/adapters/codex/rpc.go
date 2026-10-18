@@ -41,6 +41,7 @@ type rpc struct {
 	pending       map[string]chan envelope
 	next          atomic.Uint64
 	done          chan struct{}
+	stopped       chan struct{}
 	err           error
 	notifications chan envelope
 }
@@ -65,6 +66,7 @@ func newRPC(binary string, stderr io.Writer) (*rpc, error) {
 		stdin:         stdin,
 		pending:       map[string]chan envelope{},
 		done:          make(chan struct{}),
+		stopped:       make(chan struct{}),
 		notifications: make(chan envelope, 128),
 	}
 	go client.read(stdout)
@@ -119,6 +121,7 @@ func (r *rpc) call(ctx context.Context, method string, params, result any) error
 }
 
 func (r *rpc) read(stdout io.Reader) {
+	defer close(r.stopped)
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
 	for scanner.Scan() {
@@ -155,11 +158,10 @@ func (r *rpc) read(stdout io.Reader) {
 		if len(message.ID) == 0 && !isWorkerNotification(message.Method) {
 			continue
 		}
+		// Backpressure pauses stdout reading without dropping notifications or
+		// growing an unbounded queue. Shutdown releases a blocked delivery.
 		select {
 		case r.notifications <- message:
-		default:
-			r.finish(errors.New("Codex notification buffer exhausted; reconcile native state"))
-			return
 		case <-r.done:
 			return
 		}
@@ -188,7 +190,9 @@ func (r *rpc) close() error {
 	r.stdin.Close()
 	// Kill only this owned runtime. Workers never belong to the supervisor process.
 	_ = r.cmd.Process.Kill()
-	return r.cmd.Wait()
+	err := r.cmd.Wait()
+	<-r.stopped
+	return err
 }
 
 func isWorkerNotification(method string) bool {

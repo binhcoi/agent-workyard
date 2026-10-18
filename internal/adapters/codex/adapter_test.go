@@ -81,6 +81,18 @@ func protocolPeer() {
 				reply(map[string]any{"turn": map[string]any{"id": turn, "status": "inProgress"}})
 				continue
 			}
+			if strings.Contains(text, "burst") {
+				for i := range burstItemCount {
+					item := map[string]any{"id": fmt.Sprintf("burst-%d", i), "type": "agentMessage", "phase": "commentary", "text": "progress"}
+					if strings.Contains(text, "tools") {
+						item = map[string]any{"id": fmt.Sprintf("burst-%d", i), "type": "commandExecution", "command": "printf progress", "cwd": "/fixture", "commandActions": []any{}, "status": "completed", "exitCode": 0, "aggregatedOutput": "progress"}
+					}
+					notify("item/completed", map[string]any{
+						"threadId": params.ThreadID, "turnId": turn,
+						"item": item,
+					})
+				}
+			}
 			notify("item/completed", map[string]any{
 				"threadId":      params.ThreadID,
 				"turnId":        turn,
@@ -114,7 +126,20 @@ func protocolPeer() {
 				},
 			})
 			notify("turn/completed", map[string]any{"threadId": params.ThreadID, "turn": map[string]any{"id": turn, "status": "completed", "items": []any{}}})
+			if strings.Contains(text, "burst") {
+				if gate := os.Getenv("WORKYARD_PROTOCOL_START_GATE"); gate != "" {
+					for {
+						if _, err := os.Stat(gate); err == nil {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+			}
 			reply(map[string]any{"turn": map[string]any{"id": turn, "status": "inProgress"}})
+			if strings.Contains(text, "burst eof") {
+				return
+			}
 		case "turn/interrupt":
 			reply(map[string]any{})
 			notify("turn/completed", map[string]any{

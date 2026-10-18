@@ -77,6 +77,10 @@ type Cancellation struct {
 }
 
 type Observation struct {
+	// Revision orders snapshots for one worker across method replies and Updates.
+	// Adapters providing revisions continue from the saved value during recovery.
+	// Zero denotes an adapter without revision support.
+	Revision     uint64
 	Worker       core.Worker
 	Conversation core.Conversation
 	Result       *core.Result

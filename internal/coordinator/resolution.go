@@ -32,13 +32,19 @@ type Resolution struct {
 
 // reconcile reads native history only. It preserves the durable launch phase
 // when evidence is inconclusive, including the prepared-before-start checkpoint.
-// The caller holds s.mu. A read error is never execution failure evidence.
+// The caller holds operations and s.mu; only s.mu is released during native I/O.
+// A read error is never execution failure evidence.
 func (s *Service) reconcile(ctx context.Context, record *Record) error {
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	saved := record.Observation
 	saved.Recovery = nil
+	s.mu.Unlock()
 	observation, err := s.adapter.Recover(callCtx, record.Start, saved)
+	s.mu.Lock()
+	if refreshErr := s.refresh(record); refreshErr != nil {
+		return refreshErr
+	}
 	if err == nil && (observation.Worker.ID != saved.Worker.ID ||
 		observation.Worker.AttemptID != saved.Worker.AttemptID ||
 		observation.Worker.TaskID != saved.Worker.TaskID ||
@@ -49,16 +55,18 @@ func (s *Service) reconcile(ctx context.Context, record *Record) error {
 	}
 	if err != nil {
 		record.Observation.Recovery = nil
-		record.Observation.Worker.State = core.StateUnknown
+		if !isTerminal(record.Observation.Worker.State) {
+			record.Observation.Worker.State = core.StateUnknown
+		}
 		record.Diagnostic = "Native reconciliation unavailable: " + err.Error()
 		return err
 	}
-	record.Observation = observation
+	s.mergeObservation(record, observation)
 	record.Diagnostic = "Reconciled saved worker without executing a new turn"
 	if observation.Recovery != nil {
 		record.Diagnostic = observation.Recovery.Detail
 	}
-	if isTerminal(observation.Worker.State) {
+	if isTerminal(record.Observation.Worker.State) {
 		record.Phase = "terminal"
 	} else {
 		record.Observation.Worker.State = core.StateUnknown
@@ -100,6 +108,8 @@ func (s *Service) ResolveTask(ctx context.Context, id core.ID, request ResolveRe
 	if request.Action != "reconcile" && strings.TrimSpace(request.Reason) == "" {
 		return Record{}, errors.New("retry and cancel resolution require an operator reason")
 	}
+	s.operations.Lock()
+	defer s.operations.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var record Record
@@ -128,6 +138,13 @@ func (s *Service) ResolveTask(ctx context.Context, id core.ID, request ResolveRe
 			return record, err
 		}
 		nativeErr := s.reconcile(ctx, &record)
+		// Native notifications may have supplied start evidence during the call.
+		if noStart {
+			noStart, err = s.neverStarted(record)
+			if err != nil {
+				return record, err
+			}
+		}
 		// The adapter's preparation contract excludes inference. A lost Prepare
 		// response may leave an orphan conversation, but no uncertain model turn.
 		if noStart && (nativeErr != nil || (record.Observation.Recovery != nil && record.Observation.Recovery.NoTurn)) {

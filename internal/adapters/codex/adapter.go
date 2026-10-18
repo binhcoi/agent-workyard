@@ -30,6 +30,7 @@ type Adapter struct {
 	threads  map[string]core.ID
 	updates  chan worker.Update
 	stop     chan struct{}
+	stopped  chan struct{}
 	once     sync.Once
 }
 
@@ -47,6 +48,7 @@ func New(ctx context.Context, binary string, stderr io.Writer) (*Adapter, error)
 		threads:  map[string]core.ID{},
 		updates:  make(chan worker.Update, 128),
 		stop:     make(chan struct{}),
+		stopped:  make(chan struct{}),
 	}
 	if err = client.call(ctx, "initialize", map[string]any{"clientInfo": map[string]string{"name": "agent_workyard", "version": "0.2.0"}}, nil); err != nil {
 		client.close()
@@ -137,7 +139,7 @@ func (a *Adapter) Prepare(ctx context.Context, request worker.StartRequest) (wor
 	}
 	a.sessions[request.WorkerID] = workerSession
 	a.threads[response.Thread.ID] = request.WorkerID
-	return snapshot(workerSession), nil
+	return advance(workerSession), nil
 }
 
 func (a *Adapter) Start(ctx context.Context, address worker.Address) (worker.Observation, error) {
@@ -178,7 +180,7 @@ func (a *Adapter) Start(ctx context.Context, address worker.Address) (worker.Obs
 	if !terminal(workerSession.observation.Worker.State) {
 		workerSession.observation.Worker.State = state(response.Turn.Status)
 	}
-	return snapshot(workerSession), nil
+	return advance(workerSession), nil
 }
 
 func (a *Adapter) Inspect(_ context.Context, address worker.Address) (worker.Observation, error) {
@@ -241,23 +243,23 @@ func (a *Adapter) Recover(ctx context.Context, request worker.StartRequest, obse
 	defer a.mu.Unlock()
 	if terminal(workerSession.observation.Worker.State) {
 		workerSession.observation.Recovery = &worker.RecoveryEvidence{Detail: "Native terminal notification already observed"}
-		return snapshot(workerSession), nil
+		return advance(workerSession), nil
 	}
 	if len(response.Data) == 0 {
 		workerSession.observation.Worker.State = core.StateUnknown
 		workerSession.observation.Recovery = &worker.RecoveryEvidence{NoTurn: response.NextCursor == nil, Detail: "Native history contains no turns; empty history alone does not prove an uncertain start never executed"}
-		return snapshot(workerSession), nil
+		return advance(workerSession), nil
 	}
 	turn := response.Data[0]
 	if nativeHandle.TurnID == "" && (len(response.Data) > 1 || response.NextCursor != nil) {
 		workerSession.observation.Worker.State = core.StateUnknown
 		workerSession.observation.Recovery = &worker.RecoveryEvidence{Detail: "Multiple native turns exist without a saved turn identity; no safe match to the attempt"}
-		return snapshot(workerSession), nil
+		return advance(workerSession), nil
 	}
 	if turn.ID == "" || (nativeHandle.TurnID != "" && turn.ID != nativeHandle.TurnID) {
 		workerSession.observation.Worker.State = core.StateUnknown
 		workerSession.observation.Recovery = &worker.RecoveryEvidence{Detail: "Native history turn identity is missing or differs from the saved attempt; no safe resolution"}
-		return snapshot(workerSession), nil
+		return advance(workerSession), nil
 	}
 	workerSession.handle.TurnID = turn.ID
 	for _, item := range turn.Items {
@@ -274,7 +276,7 @@ func (a *Adapter) Recover(ctx context.Context, request worker.StartRequest, obse
 	if turn.Error != nil {
 		workerSession.observation.Result = &core.Result{Blockers: []string{turn.Error.Message}}
 	}
-	return snapshot(workerSession), nil
+	return advance(workerSession), nil
 }
 
 func (a *Adapter) Cancel(ctx context.Context, address worker.Address) (worker.Cancellation, error) {
@@ -309,6 +311,7 @@ func (a *Adapter) Close() error {
 	a.once.Do(func() {
 		close(a.stop)
 		a.rpc.close()
+		<-a.stopped
 	})
 	return nil
 }
@@ -331,6 +334,12 @@ func snapshot(workerSession *session) worker.Observation {
 	var observation worker.Observation
 	_ = json.Unmarshal(data, &observation)
 	return observation
+}
+
+// advance publishes a newer snapshot while the session mutex is held.
+func advance(workerSession *session) worker.Observation {
+	workerSession.observation.Revision++
+	return snapshot(workerSession)
 }
 
 func terminal(state core.ExecutionState) bool {
@@ -419,14 +428,26 @@ func finishResult(workerSession *session) {
 // listen is the adapter's event loop. RPC responses are handled separately by
 // rpc.call; notifications update the appropriate worker session here.
 func (a *Adapter) listen() {
+	defer close(a.stopped)
 	defer close(a.updates)
 	for {
 		select {
 		case <-a.stop:
 			return
 		case <-a.rpc.done:
-			a.markDisconnected()
-			return
+			// The reader has stopped producing. Deliver its queued notifications
+			// before recording disconnect, including any final native evidence.
+			for {
+				select {
+				case notification := <-a.rpc.notifications:
+					if !a.handleNotification(notification) {
+						return
+					}
+				default:
+					a.markDisconnected()
+					return
+				}
+			}
 		case notification := <-a.rpc.notifications:
 			if !a.handleNotification(notification) {
 				return
@@ -437,13 +458,22 @@ func (a *Adapter) listen() {
 
 func (a *Adapter) markDisconnected() {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	for _, workerSession := range a.sessions {
+	workerIDs := make([]core.ID, 0, len(a.sessions))
+	for id := range a.sessions {
+		workerIDs = append(workerIDs, id)
+	}
+	a.mu.Unlock()
+	for _, id := range workerIDs {
+		a.mu.Lock()
+		workerSession := a.sessions[id]
 		if terminal(workerSession.observation.Worker.State) {
+			a.mu.Unlock()
 			continue
 		}
 		workerSession.observation.Worker.State = core.StateUnknown
-		if !a.emit(workerSession, "runtime.disconnected", "Codex App Server disconnected; reconcile before retrying") {
+		update := worker.Update{Observation: advance(workerSession), Kind: "runtime.disconnected", Evidence: "Codex App Server disconnected; reconcile before retrying"}
+		a.mu.Unlock()
+		if !a.emit(update) {
 			return
 		}
 	}
@@ -474,10 +504,10 @@ func (a *Adapter) handleNotification(notification envelope) bool {
 	}
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	workerID := a.threads[params.ThreadID]
 	workerSession := a.sessions[workerID]
 	if workerSession == nil {
+		a.mu.Unlock()
 		return true
 	}
 
@@ -515,14 +545,19 @@ func (a *Adapter) handleNotification(notification envelope) bool {
 			},
 		}
 	default:
+		a.mu.Unlock()
 		return true
 	}
-	return a.emit(workerSession, notification.Method, string(notification.Params))
+	update := worker.Update{Observation: advance(workerSession), Kind: notification.Method, Evidence: string(notification.Params)}
+	a.mu.Unlock()
+	return a.emit(update)
 }
 
-func (a *Adapter) emit(workerSession *session, kind, evidence string) bool {
+// Only listen sends updates, preserving notification order. Snapshot under mu,
+// then release it before applying bounded backpressure to the event producer.
+func (a *Adapter) emit(update worker.Update) bool {
 	select {
-	case a.updates <- worker.Update{Observation: snapshot(workerSession), Kind: kind, Evidence: evidence}:
+	case a.updates <- update:
 		return true
 	case <-a.stop:
 		return false

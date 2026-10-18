@@ -40,6 +40,9 @@ type Record struct {
 
 // Service owns task lifecycle independently of any submitting client.
 type Service struct {
+	// operations preserves lifecycle operation ordering while mu is released for
+	// native calls. Take it before mu; the update consumer never takes it.
+	operations sync.Mutex
 	// mu protects lifecycle changes shared by HTTP handlers and the execution loop.
 	mu          sync.Mutex
 	store       *store.Store
@@ -437,15 +440,45 @@ func (s *Service) signal() {
 
 // Run belongs to the coordinator lifetime, never an HTTP request or supervisor.
 func (s *Service) Run(ctx context.Context) {
-	if err := s.recover(ctx); err != nil {
-		s.errors <- err
-		return
-	}
-	s.signal()
+	ctx, cancel := context.WithCancel(ctx)
+	operationsDone := make(chan error, 1)
+	go func() {
+		if err := s.recover(ctx); err != nil {
+			operationsDone <- err
+			return
+		}
+		s.signal()
+		for {
+			select {
+			case <-ctx.Done():
+				operationsDone <- nil
+				return
+			case <-s.wake:
+				if err := s.dispatch(ctx); err != nil {
+					operationsDone <- err
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		cancel()
+		// Closing the owned adapter also unblocks native I/O during shutdown.
+		s.adapter.Close()
+		if operationsDone != nil {
+			<-operationsDone
+		}
+	}()
 	updates := s.adapter.Updates()
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case err := <-operationsDone:
+			operationsDone = nil
+			if err != nil {
+				s.errors <- err
+			}
 			return
 		case update, ok := <-updates:
 			if !ok {
@@ -463,16 +496,13 @@ func (s *Service) Run(ctx context.Context) {
 				return
 			}
 			s.signal()
-		case <-s.wake:
-			if err := s.dispatch(ctx); err != nil {
-				s.errors <- err
-				return
-			}
 		}
 	}
 }
 
 func (s *Service) recover(ctx context.Context) error {
+	s.operations.Lock()
+	defer s.operations.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	records, err := s.records()
@@ -480,6 +510,12 @@ func (s *Service) recover(ctx context.Context) error {
 		return err
 	}
 	for _, record := range records {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := s.refresh(&record); err != nil {
+			return err
+		}
 		if isTerminal(record.Observation.Worker.State) || record.Phase == "queued" {
 			continue
 		}
@@ -494,6 +530,8 @@ func (s *Service) recover(ctx context.Context) error {
 }
 
 func (s *Service) dispatch(ctx context.Context) error {
+	s.operations.Lock()
+	defer s.operations.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.unavailable {
@@ -510,6 +548,13 @@ func (s *Service) dispatch(ctx context.Context) error {
 		}
 	}
 	for _, record := range records {
+		if ctx.Err() != nil || s.unavailable {
+			return nil
+		}
+		// Updates can change other records while a native call releases mu.
+		if err := s.refresh(&record); err != nil {
+			return err
+		}
 		if record.Phase != "queued" || inUse >= s.catalog.MaxConcurrent {
 			continue
 		}
@@ -537,15 +582,25 @@ func (s *Service) launchWorker(ctx context.Context, record *Record) error {
 
 	// Prepare creates a conversation without starting model inference.
 	prepareCtx, cancelPrepare := context.WithTimeout(ctx, 30*time.Second)
+	s.mu.Unlock()
 	observation, err := s.adapter.Prepare(prepareCtx, record.Start)
 	cancelPrepare()
+	s.mu.Lock()
+	if refreshErr := s.refresh(record); refreshErr != nil {
+		return refreshErr
+	}
 	if err != nil {
 		setLaunchError(record, err)
 		return s.save(record, "worker.prepare_unknown", err.Error())
 	}
 
-	record.Observation = observation
+	s.mergeObservation(record, observation)
 	record.Phase = "prepared"
+	if ctx.Err() != nil || s.unavailable {
+		record.Observation.Worker.State = core.StateUnknown
+		record.Diagnostic = "Runtime stopped after preparation; no start requested"
+		return s.save(record, "worker.prepared", record.Diagnostic)
+	}
 	if err := s.save(record, "worker.prepared", ""); err != nil {
 		return err
 	}
@@ -558,18 +613,57 @@ func (s *Service) launchWorker(ctx context.Context, record *Record) error {
 	}
 
 	startCtx, cancelStart := context.WithTimeout(ctx, 30*time.Second)
+	s.mu.Unlock()
 	observation, err = s.adapter.Start(startCtx, address(record.Observation))
 	cancelStart()
+	s.mu.Lock()
+	if refreshErr := s.refresh(record); refreshErr != nil {
+		return refreshErr
+	}
 	if err != nil {
 		setLaunchError(record, err)
 	} else {
-		record.Observation = observation
+		s.mergeObservation(record, observation)
 		record.Phase = "active"
+	}
+	if isTerminal(record.Observation.Worker.State) {
+		record.Phase = "terminal"
 	}
 	return s.save(record, "worker.start_observed", record.Diagnostic)
 }
 
+// refresh preserves updates committed while a native call ran without mu.
+// operations prevents another lifecycle command from retiring this attempt.
+func (s *Service) refresh(record *Record) error {
+	var current Record
+	if err := s.store.Get("task", record.Request.Task.ID, &current); err != nil {
+		return err
+	}
+	if current.Attempt.ID != record.Attempt.ID {
+		return errors.New("attempt changed during lifecycle operation")
+	}
+	*record = current
+	return nil
+}
+
+func (s *Service) mergeObservation(record *Record, observation worker.Observation) {
+	if observation.Revision != 0 && observation.Revision < record.Observation.Revision {
+		return
+	}
+	if isTerminal(record.Observation.Worker.State) && !isTerminal(observation.Worker.State) {
+		return
+	}
+	record.Observation = observation
+	if s.unavailable && !isTerminal(record.Observation.Worker.State) {
+		record.Observation.Worker.State = core.StateUnknown
+	}
+}
+
 func setLaunchError(record *Record, err error) {
+	if isTerminal(record.Observation.Worker.State) {
+		record.Diagnostic = err.Error()
+		return
+	}
 	record.Observation.Worker.State = core.StateUnknown
 	record.Phase = "ambiguous"
 	record.Diagnostic = err.Error()
@@ -598,12 +692,14 @@ func (s *Service) apply(update worker.Update) error {
 		}
 		return errors.New("adapter observation worker mismatch")
 	}
-	// A late turn/started must not overwrite a completion captured in Start.
-	if isTerminal(record.Observation.Worker.State) && !isTerminal(update.Observation.Worker.State) {
-		return nil
+	// Journal every notification in arrival order, even when an RPC reply has
+	// already checkpointed a newer snapshot. Older snapshots cannot regress it.
+	s.mergeObservation(&record, update.Observation)
+	if isTerminal(record.Observation.Worker.State) {
+		record.Phase = "terminal"
+	} else if record.Phase != "preparing" && record.Phase != "prepared" && record.Phase != "starting" {
+		record.Phase = "active"
 	}
-	record.Observation = update.Observation
-	record.Phase = "active"
 	return s.save(&record, update.Kind, update.Evidence)
 }
 
@@ -628,6 +724,8 @@ func (s *Service) disconnected() error {
 }
 
 func (s *Service) CancelTask(ctx context.Context, id core.ID) (worker.Cancellation, error) {
+	s.operations.Lock()
+	defer s.operations.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var record Record
@@ -647,7 +745,12 @@ func (s *Service) CancelTask(ctx context.Context, id core.ID) (worker.Cancellati
 	if err := s.save(&record, "worker.cancel_intent", ""); err != nil {
 		return worker.Cancellation{}, err
 	}
+	s.mu.Unlock()
 	cancellation, err := s.adapter.Cancel(ctx, address(record.Observation))
+	s.mu.Lock()
+	if refreshErr := s.refresh(&record); refreshErr != nil {
+		return cancellation, refreshErr
+	}
 	if err != nil {
 		record.Diagnostic = err.Error()
 		if saveErr := s.save(&record, "worker.cancel_unknown", record.Diagnostic); saveErr != nil {
@@ -655,7 +758,7 @@ func (s *Service) CancelTask(ctx context.Context, id core.ID) (worker.Cancellati
 		}
 		return cancellation, err
 	}
-	if cancellation.Confirmed {
+	if cancellation.Confirmed && !isTerminal(record.Observation.Worker.State) {
 		record.Observation.Worker.State = core.StateCancelled
 	}
 	if err = s.save(&record, "worker.cancel_requested", cancellation.Evidence); err != nil {
