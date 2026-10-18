@@ -126,16 +126,34 @@ func protocolPeer() {
 				},
 			})
 		case "thread/turns/list":
-			reply(map[string]any{
-				"data": []any{
-					map[string]any{
-						"id":     params.ThreadID + "-turn",
-						"status": "completed",
-						"items": []any{
-							map[string]any{"id": "recovered-message", "type": "agentMessage", "text": final},
-						},
-					},
+			if strings.Contains(params.ThreadID, "missing") {
+				send(map[string]any{"id": message.ID, "error": map[string]any{"code": -32602, "message": "thread not found"}})
+				continue
+			}
+			if strings.Contains(params.ThreadID, "empty") {
+				reply(map[string]any{"data": []any{}, "nextCursor": nil})
+				continue
+			}
+			status := os.Getenv("WORKYARD_PROTOCOL_HISTORY")
+			if status == "" {
+				status = "completed"
+			}
+			for _, candidate := range []string{"interrupted", "failed", "inProgress", "unrecognized"} {
+				if strings.Contains(params.ThreadID, candidate) {
+					status = candidate
+				}
+			}
+			turns := []any{
+				map[string]any{
+					"id": params.ThreadID + "-turn", "status": status,
+					"items": []any{map[string]any{"id": "recovered-message", "type": "agentMessage", "text": final}},
 				},
+			}
+			if strings.Contains(params.ThreadID, "multiple") {
+				turns = append(turns, map[string]any{"id": "older", "status": "completed"})
+			}
+			reply(map[string]any{
+				"data":       turns,
 				"nextCursor": nil,
 			})
 		default:
@@ -345,5 +363,71 @@ func TestRejectedStartIsDefinite(t *testing.T) {
 	var rpcErr *rpcError
 	if !errors.As(err, &rpcErr) || rpcErr.Code != -32602 {
 		t.Fatalf("explicit rejection lost: %v", err)
+	}
+}
+
+func TestNativeResolutionEvidenceWithoutInference(t *testing.T) {
+	for _, tc := range []struct {
+		thread, turn      string
+		want              core.ExecutionState
+		noTurn, readError bool
+	}{
+		{"interrupted", "interrupted-turn", core.StateCancelled, false, false},
+		{"failed", "failed-turn", core.StateFailed, false, false},
+		{"completed", "completed-turn", core.StateCompleted, false, false},
+		{"inProgress", "inProgress-turn", core.StateUnknown, false, false},
+		{"unrecognized", "unrecognized-turn", core.StateUnknown, false, false},
+		{"empty", "", core.StateUnknown, true, false},
+		{"missing", "", core.StateUnknown, false, true},
+		{"mismatch", "original-turn", core.StateUnknown, false, false},
+		{"multiple", "", core.StateUnknown, false, false},
+		{"lost-ack", "", core.StateCompleted, false, false},
+	} {
+		t.Run(tc.thread, func(t *testing.T) {
+			a, log := testAdapter(t)
+			request := testRequest("one", "verify")
+			prepared := worker.Observation{
+				Worker:       core.Worker{ID: request.WorkerID, TaskID: request.TaskID, AttemptID: request.AttemptID, ConversationID: request.ConversationID, RuntimeID: "codex-local", State: core.StateUnknown},
+				Conversation: core.Conversation{ID: request.ConversationID, WorkerID: request.WorkerID},
+			}
+			prepared.Handle, _ = json.Marshal(handle{ThreadID: tc.thread, TurnID: tc.turn})
+			got, err := a.Recover(context.Background(), request, prepared)
+			if (err != nil) != tc.readError {
+				t.Fatal(err)
+			}
+			if got.Worker.State != tc.want {
+				t.Fatalf("native outcome: %+v", got)
+			}
+			if !tc.readError && (got.Recovery == nil || got.Recovery.NoTurn != tc.noTurn || got.Recovery.Detail == "") {
+				t.Fatal("missing reconciliation evidence", got.Recovery)
+			}
+			data, err := os.ReadFile(log)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(data), `"method":"turn/start"`) || strings.Contains(string(data), `"method":"thread/start"`) {
+				t.Fatal("reconciliation executed inference")
+			}
+		})
+	}
+}
+
+func TestRecoveryPreservesLiveTerminalEvidence(t *testing.T) {
+	a, _ := testAdapter(t)
+	ctx := context.Background()
+	request := testRequest("one", "verify fixture")
+	prepared, err := a.Prepare(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Start(ctx, addr(prepared)); err != nil {
+		t.Fatal(err)
+	}
+	done := awaitState(t, a, prepared, core.StateCompleted)
+	// Simulate a durable snapshot predating the completion and usage events.
+	prepared.Worker.State = core.StateUnknown
+	got, err := a.Recover(ctx, request, prepared)
+	if err != nil || got.Worker.State != core.StateCompleted || got.Result == nil || got.Result.Summary != done.Result.Summary || len(got.Usage) != 1 || *got.Usage[0].InputTokens != 42 {
+		t.Fatalf("live evidence overwritten: %+v, %v", got, err)
 	}
 }

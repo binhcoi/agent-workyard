@@ -20,6 +20,8 @@ const usage = `Usage:
   workyard assignment list --state DIR
   workyard task submit --state DIR --id ID --assignment ID --project DIR --brief FILE --bundle DIR [--profile ID] [--skill ID ...] [--effort LEVEL]
   workyard task status|result|conversation|events|cancel --state DIR --id ID
+  workyard task attempts --state DIR --id ID
+  workyard task resolve --state DIR --id ID --attempt ID [--action reconcile|cancel|retry] [--reason TEXT]
   workyard task list --state DIR
 
 Run the coordinator separately from supervisor sessions. M2 workers use read-only execution.

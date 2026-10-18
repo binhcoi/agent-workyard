@@ -41,7 +41,7 @@ func execution(args []string, out, stderr io.Writer) error {
 		return putAssignmentCommand(args[2:], out, stderr)
 	case "task submit":
 		return submitTaskCommand(args[2:], out, stderr)
-	case "task status", "task result", "task conversation", "task events", "task cancel":
+	case "task status", "task result", "task conversation", "task events", "task attempts", "task cancel", "task resolve":
 		return taskCommand(args[1], args[2:], out, stderr)
 	case "task list", "assignment list", "coordinator resources", "coordinator runtime":
 		return listCommand(args[0], args[1], args[2:], out, stderr)
@@ -206,21 +206,35 @@ func taskCommand(operation string, args []string, out, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	stateDir := flags.String("state", "", "private coordinator state directory (required)")
 	id := flags.String("id", "", "task ID")
+	var attemptID, action, reason string
+	if operation == "resolve" {
+		flags.StringVar(&attemptID, "attempt", "", "attempt ID from task status (required)")
+		flags.StringVar(&action, "action", "reconcile", "reconcile, cancel, or retry")
+		flags.StringVar(&reason, "reason", "", "operator reason (required for cancel or retry)")
+	}
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *stateDir == "" || *id == "" || flags.NArg() != 0 {
 		return errors.New("task operation requires --state and --id")
 	}
+	if operation == "resolve" && (attemptID == "" || (action != "reconcile" && action != "cancel" && action != "retry") ||
+		(action != "reconcile" && strings.TrimSpace(reason) == "")) {
+		return errors.New("resolve requires --attempt, --action reconcile|cancel|retry, and --reason for cancel or retry")
+	}
 	path := "/task/" + url.PathEscape(*id)
 	if operation != "status" {
 		path += "/" + operation
 	}
 	method := "GET"
-	if operation == "cancel" {
+	if operation == "cancel" || operation == "resolve" {
 		method = "POST"
 	}
-	responseData, err := coordinatorRequest(*stateDir, method, path, nil)
+	var payload any
+	if operation == "resolve" {
+		payload = coordinator.ResolveRequest{AttemptID: core.ID(attemptID), Action: action, Reason: reason}
+	}
+	responseData, err := coordinatorRequest(*stateDir, method, path, payload)
 	return writeResponse(out, responseData, err)
 }
 

@@ -96,6 +96,19 @@ func (s *Service) Handler(token string) http.Handler {
 		events, err := s.Events(core.ID(r.PathValue("id")))
 		respond(w, events, err)
 	})
+	mux.HandleFunc("GET /task/{id}/attempts", func(w http.ResponseWriter, r *http.Request) {
+		attempts, err := s.Attempts(core.ID(r.PathValue("id")))
+		respond(w, attempts, err)
+	})
+	mux.HandleFunc("POST /task/{id}/resolve", func(w http.ResponseWriter, r *http.Request) {
+		var request ResolveRequest
+		if err := decode(w, r, &request); err != nil {
+			fail(w, err)
+			return
+		}
+		record, err := s.ResolveTask(r.Context(), core.ID(r.PathValue("id")), request)
+		respond(w, record, err)
+	})
 	mux.HandleFunc("POST /task/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		cancellation, err := s.CancelTask(r.Context(), core.ID(r.PathValue("id")))
 		respond(w, cancellation, err)
@@ -129,6 +142,9 @@ func fail(w http.ResponseWriter, err error) {
 	code := http.StatusBadRequest
 	if errors.Is(err, sql.ErrNoRows) {
 		code = http.StatusNotFound
+	}
+	if errors.Is(err, ErrResolutionBlocked) {
+		code = http.StatusConflict
 	}
 	w.WriteHeader(code)
 	reply(w, map[string]string{"error": err.Error()})

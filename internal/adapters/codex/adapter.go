@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -207,15 +208,29 @@ func (a *Adapter) Recover(ctx context.Context, request worker.StartRequest, obse
 		return observation, errors.New("missing saved Codex thread")
 	}
 	a.mu.Lock()
-	workerSession := &session{request: request, observation: observation, handle: nativeHandle}
+	// Preserve notifications already received by this live adapter. Replacing a
+	// session with an older durable snapshot can discard terminal evidence.
+	workerSession := a.sessions[observation.Worker.ID]
+	if workerSession == nil {
+		workerSession = &session{request: request, observation: observation, handle: nativeHandle}
+	} else if workerSession.handle.ThreadID != nativeHandle.ThreadID {
+		a.mu.Unlock()
+		return observation, errors.New("saved Codex thread differs from the live worker binding")
+	}
+	if nativeHandle.TurnID == "" {
+		nativeHandle.TurnID = workerSession.handle.TurnID
+	}
 	a.sessions[observation.Worker.ID] = workerSession
 	a.threads[nativeHandle.ThreadID] = observation.Worker.ID
 	a.mu.Unlock()
 	// Reading history never executes a new turn. Page the latest turn with full items.
-	var response struct{ Data []nativeTurn }
+	var response struct {
+		Data       []nativeTurn
+		NextCursor *string
+	}
 	params := map[string]any{
 		"threadId":      nativeHandle.ThreadID,
-		"limit":         1,
+		"limit":         2,
 		"sortDirection": "desc",
 		"itemsView":     "full",
 	}
@@ -224,13 +239,24 @@ func (a *Adapter) Recover(ctx context.Context, request worker.StartRequest, obse
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if terminal(workerSession.observation.Worker.State) {
+		workerSession.observation.Recovery = &worker.RecoveryEvidence{Detail: "Native terminal notification already observed"}
+		return snapshot(workerSession), nil
+	}
 	if len(response.Data) == 0 {
 		workerSession.observation.Worker.State = core.StateUnknown
+		workerSession.observation.Recovery = &worker.RecoveryEvidence{NoTurn: response.NextCursor == nil, Detail: "Native history contains no turns; empty history alone does not prove an uncertain start never executed"}
 		return snapshot(workerSession), nil
 	}
 	turn := response.Data[0]
-	if nativeHandle.TurnID != "" && turn.ID != nativeHandle.TurnID {
+	if nativeHandle.TurnID == "" && (len(response.Data) > 1 || response.NextCursor != nil) {
 		workerSession.observation.Worker.State = core.StateUnknown
+		workerSession.observation.Recovery = &worker.RecoveryEvidence{Detail: "Multiple native turns exist without a saved turn identity; no safe match to the attempt"}
+		return snapshot(workerSession), nil
+	}
+	if turn.ID == "" || (nativeHandle.TurnID != "" && turn.ID != nativeHandle.TurnID) {
+		workerSession.observation.Worker.State = core.StateUnknown
+		workerSession.observation.Recovery = &worker.RecoveryEvidence{Detail: "Native history turn identity is missing or differs from the saved attempt; no safe resolution"}
 		return snapshot(workerSession), nil
 	}
 	workerSession.handle.TurnID = turn.ID
@@ -238,7 +264,8 @@ func (a *Adapter) Recover(ctx context.Context, request worker.StartRequest, obse
 		applyItem(workerSession, item, time.Time{})
 	}
 	workerSession.observation.Worker.State = state(turn.Status)
-	if workerSession.observation.Worker.State == core.StateRunning || workerSession.observation.Worker.State == core.StateCancelled {
+	workerSession.observation.Recovery = &worker.RecoveryEvidence{Detail: fmt.Sprintf("Native history turn %s has status %s", turn.ID, turn.Status)}
+	if workerSession.observation.Worker.State == core.StateRunning {
 		workerSession.observation.Worker.State = core.StateUnknown
 	}
 	if workerSession.observation.Worker.State == core.StateCompleted {

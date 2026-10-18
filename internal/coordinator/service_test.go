@@ -24,6 +24,7 @@ type fakeAdapter struct {
 	observations       map[core.ID]worker.Observation
 	recoverObservation *worker.Observation
 	startError         error
+	recoverError       error
 }
 
 func fake() *fakeAdapter {
@@ -66,6 +67,9 @@ func (f *fakeAdapter) Recover(_ context.Context, _ worker.StartRequest, observat
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.recovered++
+	if f.recoverError != nil {
+		return observation, f.recoverError
+	}
 	if f.recoverObservation != nil {
 		return *f.recoverObservation, nil
 	}
@@ -445,5 +449,28 @@ func TestStoredTerminalResultDoesNotContactRuntimeOnRestart(t *testing.T) {
 	defer recoveredAdapter.mu.Unlock()
 	if recoveredAdapter.recovered != 0 || recoveredAdapter.starts != 0 {
 		t.Fatal("terminal state unnecessarily contacted runtime")
+	}
+}
+
+func TestRecoveryPreservesPreparedCheckpoint(t *testing.T) {
+	service, adapter, _, closeStore := fixture(t)
+	defer closeStore()
+	request := taskFor(t, service, "prepared")
+	record := newPendingRecord(request)
+	observation, err := adapter.Prepare(context.Background(), record.Start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Observation = observation
+	record.Phase = "prepared"
+	if err = service.save(&record, "worker.prepare_intent", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err = service.recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := service.Get("prepared")
+	if err != nil || got.Phase != "prepared" || got.Observation.Worker.State != core.StateUnknown || adapter.count() != 0 {
+		t.Fatalf("prepared launch checkpoint lost: %+v, %v", got, err)
 	}
 }

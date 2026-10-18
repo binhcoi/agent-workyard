@@ -5,7 +5,8 @@ harness-neutral Go coordinator for independently managed workers.
 
 M1 is verified. The first M2 slice adds a durable local coordinator, a structured
 Codex App Server adapter, separate worker conversations, status/result retrieval,
-cancellation and conservative recovery. Codex is the only R0 worker adapter; the
+cancellation, conservative recovery and evidence-based operator resolution with
+explicit retries. Codex is the only R0 worker adapter; the
 supervisor can use any compatible harness. Messaging and coding collaboration
 remain later work. See [the M2 runbook and remaining gaps](docs/m2.md).
 

@@ -86,6 +86,14 @@ type Observation struct {
 	// interpreting native thread/turn identifiers.
 	Handle  json.RawMessage
 	Entries []ConversationEntry
+	// Recovery records native history evidence. NoTurn means history was empty,
+	// not proof that an unacknowledged start never executed.
+	Recovery *RecoveryEvidence
+}
+
+type RecoveryEvidence struct {
+	NoTurn bool
+	Detail string
 }
 
 type Update struct {

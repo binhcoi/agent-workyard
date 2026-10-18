@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -33,6 +34,8 @@ type Record struct {
 	Phase           string
 	CancelRequested bool
 	Diagnostic      string
+	Resolution      *Resolution
+	NotStarted      bool // Proven by the durable preparation/start journal.
 }
 
 // Service owns task lifecycle independently of any submitting client.
@@ -303,11 +306,53 @@ func (s *Service) records() ([]Record, error) {
 }
 
 func (s *Service) Events(id core.ID) ([]store.Event, error) {
-	record, err := s.Get(id)
+	attempts, err := s.Attempts(id)
 	if err != nil {
 		return nil, err
 	}
-	return s.store.Events(record.Observation.Worker.ID)
+	workers := map[core.ID]bool{}
+	for _, attempt := range attempts {
+		workers[attempt.Attempt.WorkerID] = true
+	}
+	events, err := s.store.Events("")
+	if err != nil {
+		return nil, err
+	}
+	filtered := []store.Event{}
+	for _, event := range events {
+		if workers[event.WorkerID] {
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered, nil
+}
+
+// Attempts returns all immutable identities and their latest snapshots, oldest
+// first. Older databases have only a task snapshot until their next save.
+func (s *Service) Attempts(id core.ID) ([]Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var current Record
+	if err := s.store.Get("task", id, &current); err != nil {
+		return nil, err
+	}
+	rows, err := s.store.List("attempt")
+	if err != nil {
+		return nil, err
+	}
+	attempts := []Record{}
+	for _, row := range rows {
+		var record Record
+		if err := json.Unmarshal(row, &record); err != nil {
+			return nil, err
+		}
+		if record.Attempt.TaskID == id && record.Attempt.ID != current.Attempt.ID {
+			attempts = append(attempts, record)
+		}
+	}
+	attempts = append(attempts, current)
+	sort.Slice(attempts, func(i, j int) bool { return attempts[i].Attempt.Number < attempts[j].Attempt.Number })
+	return attempts, nil
 }
 
 func (s *Service) Resources(ctx context.Context) ([]core.ModelOption, error) {
@@ -360,19 +405,26 @@ func occupied(record Record) bool {
 
 // save commits the snapshot, task state and event in the same transaction.
 func (s *Service) save(record *Record, kind, detail string) error {
-	record.Attempt.State = record.Observation.Worker.State
 	return s.store.Update(func(tx *store.Tx) error {
-		if err := tx.Put("task", record.Request.Task.ID, record); err != nil {
-			return err
-		}
-		task := record.Request.Task
-		task.State = record.Observation.Worker.State
-		task.Acceptance = core.AcceptancePending
-		if err := tx.Put("task_state", task.ID, task); err != nil {
-			return err
-		}
-		return tx.Event(record.Observation.Worker.ID, kind, detail)
+		return saveRecord(tx, record, kind, detail)
 	})
+}
+
+func saveRecord(tx *store.Tx, record *Record, kind, detail string) error {
+	record.Attempt.State = record.Observation.Worker.State
+	if err := tx.Put("attempt", record.Attempt.ID, record); err != nil {
+		return err
+	}
+	if err := tx.Put("task", record.Request.Task.ID, record); err != nil {
+		return err
+	}
+	task := record.Request.Task
+	task.State = record.Observation.Worker.State
+	task.Acceptance = core.AcceptancePending
+	if err := tx.Put("task_state", task.ID, task); err != nil {
+		return err
+	}
+	return tx.Event(record.Observation.Worker.ID, kind, detail)
 }
 
 // signal coalesces wake-ups: one pending signal is enough to check the queue.
@@ -433,20 +485,7 @@ func (s *Service) recover(ctx context.Context) error {
 		}
 		// Prepared conversations have not launched a turn. No native inference is
 		// repeated here, even if a crash occurred after an unacknowledged start.
-		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		observation, err := s.adapter.Recover(callCtx, record.Start, record.Observation)
-		cancel()
-		if err != nil {
-			record.Observation.Worker.State = core.StateUnknown
-			record.Diagnostic = err.Error()
-		} else {
-			record.Observation = observation
-			record.Diagnostic = "Reconciled saved worker without executing a new turn"
-		}
-		record.Phase = "reconciled"
-		if !isTerminal(record.Observation.Worker.State) {
-			record.Observation.Worker.State = core.StateUnknown
-		}
+		s.reconcile(ctx, &record)
 		if err = s.save(&record, "worker.recovered", record.Diagnostic); err != nil {
 			return err
 		}
@@ -549,6 +588,14 @@ func (s *Service) apply(update worker.Update) error {
 		return err
 	}
 	if record.Observation.Worker.ID != update.Observation.Worker.ID {
+		// Notifications buffered before an explicit retry still target the old
+		// attempt. Its terminal snapshot must not overwrite the current attempt.
+		var previous Record
+		if err := s.store.Get("attempt", update.Observation.Worker.AttemptID, &previous); err == nil &&
+			previous.Attempt.TaskID == record.Request.Task.ID &&
+			previous.Attempt.WorkerID == update.Observation.Worker.ID && isTerminal(previous.Attempt.State) {
+			return nil
+		}
 		return errors.New("adapter observation worker mismatch")
 	}
 	// A late turn/started must not overwrite a completion captured in Start.
