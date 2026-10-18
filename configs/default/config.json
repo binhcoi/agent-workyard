@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "instructions": ["instructions/common.md"],
+  "profiles": {
+    "supervisor": {
+      "kind": "supervisor",
+      "instructions": ["profiles/supervisor.md"]
+    },
+    "general-worker": {
+      "kind": "worker",
+      "instructions": ["profiles/general-worker.md"]
+    },
+    "implementer": {
+      "kind": "worker",
+      "instructions": ["profiles/general-worker.md", "profiles/implementer.md"]
+    },
+    "reviewer": {
+      "kind": "worker",
+      "instructions": ["profiles/general-worker.md", "profiles/reviewer.md"]
+    }
+  },
+  "skills": {
+    "workyard-plan": "skills/workyard-plan/SKILL.md",
+    "workyard-handoff": "skills/workyard-handoff/SKILL.md",
+    "workyard-verify": "skills/workyard-verify/SKILL.md"
+  }
+}
